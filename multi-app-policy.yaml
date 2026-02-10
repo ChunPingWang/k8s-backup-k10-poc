@@ -1,0 +1,23 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: multi-app-backup
+  namespace: kasten-io
+spec:
+  comment: "Backup multiple applications"
+  frequency: "@daily"
+  retention:
+    daily: 7
+    weekly: 4
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: minio-s3
+          namespace: kasten-io
+  selector:
+    matchExpressions:
+      - key: k10/backup
+        operator: In
+        values:
+          - "enabled"

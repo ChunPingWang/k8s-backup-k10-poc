@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k10-basic-user
+rules:
+  - apiGroups: ["apps.kio.kasten.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps.kio.kasten.io"]
+    resources: ["restorepoints"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k10-team-a-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k10-basic-user
+subjects:
+  - kind: ServiceAccount
+    name: team-a-sa
+    namespace: demo-app

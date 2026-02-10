@@ -1,0 +1,71 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: mysql-blueprint
+  namespace: kasten-io
+actions:
+  backup:
+    outputArtifacts:
+      mysqlDump:
+        keyValue:
+          dumpFile: "{{ .Phases.dumpDatabase.Output.dumpFile }}"
+    kind: StatefulSet
+    phases:
+      - func: KubeExec
+        name: dumpDatabase
+        objects:
+          mysqlSecret:
+            kind: Secret
+            name: mysql-secret
+            namespace: "{{ .StatefulSet.Namespace }}"
+        args:
+          namespace: "{{ .StatefulSet.Namespace }}"
+          pod: "{{ index .StatefulSet.Pods 0 }}"
+          container: mysql
+          command:
+            - bash
+            - -o
+            - errexit
+            - -c
+            - |
+              DUMP_FILE="/tmp/pocdb-dump-$(date +%Y%m%d%H%M%S).sql"
+              mysqldump -u root -p${MYSQL_ROOT_PASSWORD} pocdb > ${DUMP_FILE}
+              echo "Database dump created: ${DUMP_FILE}"
+              kando output dumpFile ${DUMP_FILE}
+  restore:
+    inputArtifactNames:
+      - mysqlDump
+    kind: StatefulSet
+    phases:
+      - func: KubeExec
+        name: restoreDatabase
+        objects:
+          mysqlSecret:
+            kind: Secret
+            name: mysql-secret
+            namespace: "{{ .StatefulSet.Namespace }}"
+        args:
+          namespace: "{{ .StatefulSet.Namespace }}"
+          pod: "{{ index .StatefulSet.Pods 0 }}"
+          container: mysql
+          command:
+            - bash
+            - -o
+            - errexit
+            - -c
+            - |
+              mysql -u root -p${MYSQL_ROOT_PASSWORD} pocdb < {{ .ArtifactsIn.mysqlDump.KeyValue.dumpFile }}
+              echo "Database restored successfully"
+  delete:
+    kind: StatefulSet
+    phases:
+      - func: KubeExec
+        name: cleanDump
+        args:
+          namespace: "{{ .StatefulSet.Namespace }}"
+          pod: "{{ index .StatefulSet.Pods 0 }}"
+          container: mysql
+          command:
+            - bash
+            - -c
+            - "rm -f /tmp/pocdb-dump-*.sql"

@@ -1,0 +1,34 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: Policy
+metadata:
+  name: hourly-backup-demo
+  namespace: kasten-io
+spec:
+  comment: "Hourly backup with export to MinIO"
+  frequency: "@hourly"
+  retention:
+    hourly: 24
+    daily: 7
+    weekly: 4
+    monthly: 12
+    yearly: 5
+  actions:
+    - action: backup
+      backupParameters:
+        profile:
+          name: minio-s3
+          namespace: kasten-io
+    - action: export
+      exportParameters:
+        frequency: "@hourly"
+        profile:
+          name: minio-s3
+          namespace: kasten-io
+        exportData:
+          enabled: true
+  selector:
+    matchExpressions:
+      - key: k8s.io/metadata.name
+        operator: In
+        values:
+          - demo-app

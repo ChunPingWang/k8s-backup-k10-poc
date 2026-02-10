@@ -1,0 +1,22 @@
+apiVersion: config.kio.kasten.io/v1alpha1
+kind: TransformSet
+metadata:
+  name: scale-down-transform
+  namespace: kasten-io
+spec:
+  comment: "Scale down replicas during restore"
+  transforms:
+    - subject:
+        resource: deployments
+      name: reduce-replicas
+      json:
+        - op: replace
+          path: /spec/replicas
+          value: 1
+    - subject:
+        resource: persistentvolumeclaims
+      name: change-storageclass
+      json:
+        - op: replace
+          path: /spec/storageClassName
+          value: csi-hostpath-sc
