@@ -1,99 +1,112 @@
-# Kasten K10 Backup & Restore PoC on Kind
+# Kasten K10 備份與還原 PoC — Kind 叢集
 
-A hands-on Proof of Concept for **Kasten K10** (by Veeam), a Kubernetes-native data management platform. This PoC runs entirely on a local **Kind** cluster with **MinIO** as the S3-compatible object store.
+在本機 **Kind** 叢集上實作 **Kasten K10**（Veeam 旗下產品）的完整概念驗證（Proof of Concept），使用 **MinIO** 作為 S3 相容物件儲存後端。
 
-## What is Kasten K10?
+## 什麼是 Kasten K10？
 
-Kasten K10 is an enterprise-grade backup and disaster recovery platform purpose-built for Kubernetes. Unlike traditional backup tools, K10 understands Kubernetes-native concepts — namespaces, Deployments, StatefulSets, PVCs, ConfigMaps, Secrets — and backs them up as cohesive "applications."
+Kasten K10 是專為 Kubernetes 打造的企業級備份與災難復原平台。不同於傳統備份工具，K10 理解 Kubernetes 原生概念——namespace、Deployment、StatefulSet、PVC、ConfigMap、Secret——並將它們作為整體「應用程式」進行備份。
 
-**Key capabilities:**
-- **Application Auto-Discovery** — automatically detects all workloads in your cluster
-- **Policy-Based Backup** — scheduled or on-demand, with GFS (Grandfather-Father-Son) retention
-- **Application-Aware Backup** — Kanister Blueprints enable database-consistent snapshots (e.g., `mysqldump` before snapshot)
-- **Granular Restore** — restore entire namespaces, or pick individual resources (ConfigMaps, Secrets, PVCs)
-- **Transform on Restore** — modify StorageClass, replica count, or annotations during recovery
-- **Export & Cross-Cluster DR** — export backups to S3/MinIO and import into a different cluster
-- **Web Dashboard** — full GUI for managing policies, monitoring compliance, and running restores
-- **RBAC & Multi-Tenancy** — control who can backup/restore which applications
+**核心功能：**
+- **應用自動發現** — 自動偵測叢集中所有工作負載
+- **策略式備份** — 支援排程或隨需備份，搭配 GFS（祖父-父-子）保留策略
+- **應用感知備份** — 透過 Kanister Blueprint 實現資料庫一致性快照（例如快照前先執行 `mysqldump`）
+- **細粒度還原** — 可還原整個 namespace，或僅挑選個別資源（ConfigMap、Secret、PVC）
+- **還原時轉換** — 復原時可動態修改 StorageClass、副本數、Annotation 等設定
+- **匯出與跨叢集 DR** — 將備份匯出至 S3/MinIO，並在不同叢集匯入還原
+- **Web Dashboard** — 完整的圖形化介面，管理策略、監控合規、執行還原
+- **RBAC 與多租戶** — 控制誰可以備份/還原哪些應用程式
 
-## Architecture
+## 架構總覽
 
+```mermaid
+graph TB
+    subgraph Host["Ubuntu x86 主機"]
+        subgraph Kind["Kind 叢集 (Kubernetes)"]
+            subgraph NS_K10["kasten-io namespace"]
+                Gateway["Gateway<br/>API 入口"]
+                Catalog["Catalog<br/>備份目錄"]
+                Auth["Auth<br/>認證授權"]
+                Executor["Executor ×3<br/>備份執行"]
+                Kanister["Kanister<br/>Blueprint 引擎"]
+                Dashboard["Dashboard<br/>Web UI"]
+            end
+            subgraph NS_APP["demo-app namespace"]
+                Nginx["Nginx<br/>Web 伺服器"]
+                PVC_App["PVC<br/>持久化儲存"]
+            end
+            subgraph NS_DB["demo-db namespace"]
+                MySQL["MySQL<br/>StatefulSet"]
+                PVC_DB["PVC<br/>持久化儲存"]
+            end
+            subgraph NS_MinIO["minio namespace"]
+                MinIO["MinIO<br/>S3 物件儲存"]
+                MinIO_Console["MinIO Console<br/>Web 管理介面"]
+            end
+            subgraph CSI["儲存層"]
+                CSI_Driver["CSI Hostpath Driver"]
+                Snapshot_Ctrl["Snapshot Controller"]
+            end
+        end
+        Browser["瀏覽器 → http://localhost:8080/k10/#/"]
+    end
+
+    Browser --> Gateway
+    Executor --> CSI_Driver
+    Executor --> MinIO
+    CSI_Driver --> Snapshot_Ctrl
+    Nginx --> PVC_App
+    MySQL --> PVC_DB
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Ubuntu x86 Host                          │
-│                                                              │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │                Kind Cluster (k8s)                      │  │
-│  │                                                        │  │
-│  │  ┌────────────┐  ┌──────────┐  ┌────────────────────┐ │  │
-│  │  │ kasten-io  │  │ demo-app │  │  minio namespace   │ │  │
-│  │  │ namespace  │  │ namespace│  │                    │ │  │
-│  │  │            │  │          │  │  • S3 Object Store │ │  │
-│  │  │ • Gateway  │  │ • Nginx  │  │  • Console UI     │ │  │
-│  │  │ • Catalog  │  │ • PVC    │  │                    │ │  │
-│  │  │ • Auth     │  │          │  └────────────────────┘ │  │
-│  │  │ • Executor │  └──────────┘                         │  │
-│  │  │ • Kanister │  ┌──────────┐  ┌────────────────────┐ │  │
-│  │  │ • Dashboard│  │ demo-db  │  │  CSI Hostpath      │ │  │
-│  │  └────────────┘  │ namespace│  │  Driver + Snapshot  │ │  │
-│  │                  │ • MySQL  │  │  Controller         │ │  │
-│  │                  │ • PVC    │  └────────────────────┘ │  │
-│  │                  └──────────┘                         │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                                                              │
-│  Browser → http://localhost:8080/k10/#/  (K10 Dashboard)    │
-└──────────────────────────────────────────────────────────────┘
-```
 
-## Prerequisites
+## 環境需求
 
-| Tool | Minimum | Recommended |
-|------|---------|-------------|
-| OS | Ubuntu 22.04+ x86_64 | Ubuntu 24.04 LTS |
-| CPU | 4 cores | 8 cores |
-| RAM | 12 GB | 16 GB |
-| Disk | 50 GB | 100 GB SSD |
+| 項目 | 最低需求 | 建議配置 |
+|------|---------|---------|
+| 作業系統 | Ubuntu 22.04+ x86_64 | Ubuntu 24.04 LTS |
+| CPU | 4 核心 | 8 核心 |
+| 記憶體 | 12 GB | 16 GB |
+| 磁碟 | 50 GB | 100 GB SSD |
 | Docker | 24.0+ | 27.x+ |
 | kubectl | 1.28+ | 1.30+ |
 | Helm | 3.12+ | 3.16+ |
 | Kind | 0.22+ | 0.24+ |
 
-> K10 runs 17+ pods, so 12 GB RAM is the practical minimum.
+> K10 會運行 17+ 個 Pod，因此 12 GB 記憶體是實際最低需求。
 
-## Quick Start
+## 快速開始
 
-The full step-by-step guide is in [`kasten-k10-poc-kind-ubuntu.md`](kasten-k10-poc-kind-ubuntu.md). Here's the summary:
+完整的逐步操作指南請參閱 [`kasten-k10-poc-kind-ubuntu.md`](kasten-k10-poc-kind-ubuntu.md)，以下為摘要：
 
-### 1. Create the Kind Cluster
+### 1. 建立 Kind 叢集
 
 ```bash
 kind create cluster --config kind-k10-config.yaml --wait 300s
 ```
 
-### 2. Install VolumeSnapshot Support
+### 2. 安裝 VolumeSnapshot 支援
 
 ```bash
-# CRDs
+# 安裝 CRD
 kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.2.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
 kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.2.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
 kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.2.0/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
 
-# Snapshot Controller
+# 安裝 Snapshot Controller
 kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.2.0/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
 kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/v8.2.0/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml
 
-# CSI Hostpath Driver
+# 安裝 CSI Hostpath Driver
 git clone https://github.com/kubernetes-csi/csi-driver-host-path.git
 cd csi-driver-host-path && ./deploy/kubernetes-latest/deploy.sh && cd ..
 ```
 
-### 3. Deploy MinIO (S3 Backend)
+### 3. 部署 MinIO（S3 後端儲存）
 
 ```bash
 kubectl apply -f minio-deployment.yaml
 ```
 
-### 4. Install Kasten K10
+### 4. 安裝 Kasten K10
 
 ```bash
 helm repo add kasten https://charts.kasten.io/ && helm repo update
@@ -107,18 +120,18 @@ helm install k10 kasten/k10 \
   --wait --timeout=600s
 ```
 
-### 5. Deploy Demo Applications
+### 5. 部署示範應用程式
 
 ```bash
 kubectl apply -f demo-nginx-k10.yaml
 kubectl apply -f demo-mysql-k10.yaml
 ```
 
-### 6. Configure K10
+### 6. 設定 K10
 
 ```bash
-kubectl apply -f k10-location-profile.yaml   # MinIO location profile
-kubectl apply -f mysql-blueprint.yaml         # Kanister blueprint for MySQL
+kubectl apply -f k10-location-profile.yaml   # MinIO 儲存位置設定
+kubectl apply -f mysql-blueprint.yaml         # MySQL 應用感知備份 Blueprint
 kubectl apply -f snapshot-policy-ondemand.yaml
 kubectl apply -f scheduled-policy.yaml
 kubectl apply -f multi-app-policy.yaml
@@ -126,82 +139,84 @@ kubectl apply -f transform-set.yaml
 kubectl apply -f k10-rbac.yaml
 ```
 
-### 7. Access the Dashboard
+### 7. 存取 Dashboard
 
 ```bash
 TOKEN=$(kubectl create token gateway -n kasten-io --duration=24h)
-echo "URL: http://localhost:8080/k10/#/"
+echo "網址: http://localhost:8080/k10/#/"
 echo "Token: $TOKEN"
 ```
 
-Open `http://localhost:8080/k10/#/` in your browser and paste the token to log in.
+在瀏覽器開啟 `http://localhost:8080/k10/#/`，貼上 Token 即可登入。
 
-## Project Files
+## 專案檔案說明
 
-| File | Purpose |
-|------|---------|
-| `kind-k10-config.yaml` | Kind cluster config (1 control-plane + 2 workers, port mappings) |
-| `minio-deployment.yaml` | MinIO S3-compatible object store deployment |
-| `demo-nginx-k10.yaml` | Nginx demo app with PVC, ConfigMap, Secret |
-| `demo-mysql-k10.yaml` | MySQL StatefulSet demo with persistent storage |
-| `k10-location-profile.yaml` | K10 Location Profile pointing to MinIO |
-| `mysql-blueprint.yaml` | Kanister Blueprint for application-aware MySQL backup |
-| `snapshot-policy-ondemand.yaml` | On-demand snapshot policy |
-| `scheduled-policy.yaml` | Hourly backup with export and GFS retention |
-| `multi-app-policy.yaml` | Label-based multi-application backup policy |
-| `transform-set.yaml` | Restore-time transformation rules (scale down, change StorageClass) |
-| `k10-rbac.yaml` | RBAC rules for multi-tenant access control |
-| `kasten-k10-poc-kind-ubuntu.md` | Complete PoC guide with 14 test cases |
+| 檔案 | 用途 |
+|------|------|
+| `kind-k10-config.yaml` | Kind 叢集設定（1 個控制平面 + 2 個 Worker，含 Port Mapping） |
+| `minio-deployment.yaml` | MinIO S3 相容物件儲存部署檔 |
+| `demo-nginx-k10.yaml` | Nginx 示範應用，含 PVC、ConfigMap、Secret |
+| `demo-mysql-k10.yaml` | MySQL StatefulSet 示範應用，含持久化儲存 |
+| `k10-location-profile.yaml` | K10 Location Profile，指向 MinIO |
+| `mysql-blueprint.yaml` | Kanister Blueprint，用於 MySQL 應用感知備份 |
+| `snapshot-policy-ondemand.yaml` | 隨需快照策略 |
+| `scheduled-policy.yaml` | 每小時排程備份，含匯出與 GFS 保留策略 |
+| `multi-app-policy.yaml` | 基於 Label 的多應用備份策略 |
+| `transform-set.yaml` | 還原時轉換規則（縮減副本、變更 StorageClass） |
+| `k10-rbac.yaml` | 多租戶存取控制的 RBAC 規則 |
+| `kasten-k10-poc-kind-ubuntu.md` | 完整 PoC 操作指南，包含 14 個測試案例 |
 
-## Key Concepts
+## 核心概念
 
-### Policies
-A Policy defines **what** to back up, **when**, and **where**. Policies can be scheduled (`@hourly`, `@daily`) or on-demand (`@onDemand`). Each policy includes actions like `backup` and `export`.
+### 策略（Policy）
+Policy 定義了**備份什麼**、**何時備份**、**備份到哪裡**。策略可以是排程型（`@hourly`、`@daily`）或隨需型（`@onDemand`），每個策略包含 `backup` 和 `export` 等動作。
 
-### Location Profiles
-A Profile tells K10 where to store backup data externally. This PoC uses an S3-compatible MinIO endpoint. In production, this could be AWS S3, Azure Blob, GCS, or NFS.
+### 儲存位置設定檔（Location Profile）
+Profile 告訴 K10 將備份資料儲存在哪裡。本 PoC 使用 S3 相容的 MinIO 端點。在正式環境中可以是 AWS S3、Azure Blob、GCS 或 NFS。
 
-### Restore Points
-Every successful backup creates a Restore Point — a point-in-time snapshot of an entire application (all its K8s resources + volume data). You restore from these.
+### 還原點（Restore Point）
+每次成功備份都會建立一個 Restore Point——它是整個應用程式的時間點快照（包含所有 K8s 資源 + Volume 資料）。還原操作即是從這些還原點中復原。
 
-### Kanister Blueprints
-Blueprints define application-specific backup/restore logic. For example, the MySQL blueprint runs `mysqldump` before taking a volume snapshot, ensuring database consistency.
+### Kanister Blueprint
+Blueprint 定義了應用程式專屬的備份/還原邏輯。例如 MySQL Blueprint 會在拍攝 Volume Snapshot 前先執行 `mysqldump`，確保資料庫的交易一致性。
 
-### TransformSets
-Rules applied during restore to modify resources — e.g., change StorageClass from `premium-ssd` to `standard`, or scale replicas from 3 to 1 for a DR environment.
+### 轉換集（TransformSet）
+在還原時套用的規則，可修改 K8s 資源——例如將 StorageClass 從 `premium-ssd` 改為 `standard`，或將 Replica 從 3 縮減為 1（用於 DR 環境）。
 
-## PoC Test Cases
+## PoC 測試案例
 
-| # | Test Case | Method |
-|---|-----------|--------|
-| 1 | Application Auto-Discovery | Dashboard: Applications page |
-| 2 | On-Demand Snapshot | CLI: RunAction CRD or Dashboard |
-| 3 | Scheduled Backup (Hourly + Export) | Policy with `@hourly` frequency |
-| 4 | Multi-Application Policy | Label selector: `k10/backup=enabled` |
-| 5 | CSI VolumeSnapshot | Verify `kubectl get volumesnapshots -A` |
-| 6 | Export to S3 (MinIO) | Check MinIO bucket contents |
-| 7 | Full Application Restore | Delete namespace, restore from Dashboard |
-| 8 | Granular Restore | Restore selected resources only |
-| 9 | Transform during Restore | Apply TransformSet to change config |
-| 10 | Kanister Blueprint (MySQL) | Application-aware backup with mysqldump |
-| 11 | Cross-Cluster DR | Export + Import between two Kind clusters |
-| 12 | RBAC & Multi-Tenancy | ServiceAccount-scoped access |
-| 13 | Compliance Reporting | Dashboard compliance dashboard |
-| 14 | License Management | Dashboard: Settings > Licenses |
+| # | 測試案例 | 驗證方式 |
+|---|---------|---------|
+| 1 | 應用自動發現 | Dashboard：Applications 頁面 |
+| 2 | 隨需快照 | CLI：RunAction CRD 或 Dashboard |
+| 3 | 排程備份（每小時 + 匯出） | 設定 `@hourly` 頻率的 Policy |
+| 4 | 多應用策略 | Label 選擇器：`k10/backup=enabled` |
+| 5 | CSI VolumeSnapshot | 驗證 `kubectl get volumesnapshots -A` |
+| 6 | 匯出至 S3（MinIO） | 檢查 MinIO bucket 內容 |
+| 7 | 完整應用還原 | 刪除 namespace，從 Dashboard 還原 |
+| 8 | 細粒度還原 | 僅還原選定的資源 |
+| 9 | 還原時轉換 | 套用 TransformSet 修改設定 |
+| 10 | Kanister Blueprint（MySQL） | 使用 mysqldump 的應用感知備份 |
+| 11 | 跨叢集災難復原 | 在兩個 Kind 叢集間匯出 + 匯入 |
+| 12 | RBAC 與多租戶 | 以 ServiceAccount 限定存取範圍 |
+| 13 | 合規報告 | Dashboard 合規儀表板 |
+| 14 | 授權管理 | Dashboard：Settings > Licenses |
 
-## Velero vs Kasten K10
+## Velero vs Kasten K10 比較
 
-| Feature | Velero | Kasten K10 |
+| 比較項目 | Velero | Kasten K10 |
 |---------|--------|------------|
-| **License** | Apache 2.0 (fully open source) | Starter free / Enterprise paid |
-| **Web UI** | None (CLI only) | Full Dashboard |
-| **App-Aware Backup** | Manual hooks | Kanister Blueprint framework |
-| **Auto-Discovery** | No | Yes |
-| **Transform on Restore** | No | Yes |
-| **Compliance Reports** | No | Built-in |
-| **Retention Policy** | TTL only | GFS (Grandfather-Father-Son) |
-| **Resource Usage** | Light (2-3 pods) | Heavy (17+ pods) |
-| **Best For** | DevOps teams, lightweight needs | Enterprise, compliance-driven orgs |
+| **授權方式** | Apache 2.0（完全開源） | Starter 免費 / Enterprise 付費 |
+| **Web 介面** | 無（僅 CLI） | 完整 Dashboard |
+| **應用感知備份** | 需手動撰寫 Hook | Kanister Blueprint 框架 |
+| **自動發現** | 無 | 有 |
+| **還原時轉換** | 無 | 有 |
+| **合規報告** | 無 | 內建 |
+| **保留策略** | 僅 TTL | GFS（祖父-父-子） |
+| **資源消耗** | 輕量（2-3 個 Pod） | 較重（17+ 個 Pod） |
+| **適合對象** | DevOps 團隊、輕量需求 | 企業級、合規導向的組織 |
+
+---
 
 ## Kasten K10 的優勢
 
@@ -275,15 +290,14 @@ MinIO 專為高吞吐量設計，支援：
 
 ### MinIO 在本 PoC 中的角色
 
-```
-K10 Backup Policy
-    │
-    ├─ Snapshot（CSI VolumeSnapshot）→ 本地快照
-    │
-    └─ Export → MinIO（S3 相容）
-                  │
-                  ├── k10-backup/   ← 備份資料存放
-                  └── k10-export/   ← 匯出資料存放（跨叢集 DR 用）
+```mermaid
+graph LR
+    Policy["K10 備份策略"] --> Snapshot["Snapshot<br/>CSI VolumeSnapshot"]
+    Policy --> Export["Export"]
+    Snapshot --> Local["本地快照"]
+    Export --> MinIO["MinIO（S3 相容）"]
+    MinIO --> Bucket1["k10-backup/<br/>備份資料存放"]
+    MinIO --> Bucket2["k10-export/<br/>匯出資料存放<br/>（跨叢集 DR 用）"]
 ```
 
 MinIO 在此 PoC 中扮演 **Location Profile** 的後端儲存，K10 將匯出的備份資料以 S3 協定寫入 MinIO bucket，供跨叢集還原或長期保留使用。
@@ -296,36 +310,40 @@ MinIO 在此 PoC 中扮演 **Location Profile** 的後端儲存，K10 將匯出�
 
 K10 由多個微服務組成，部署在 `kasten-io` namespace 中：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Kasten K10 元件架構                            │
-│                                                                 │
-│  ┌───────────┐    ┌──────────────┐    ┌───────────────────┐    │
-│  │  Gateway   │───▶│ Dashboard BFF │───▶│  Frontend (React) │    │
-│  │ (API 入口) │    │ (後端代理)    │    │  (Web UI)         │    │
-│  └─────┬─────┘    └──────────────┘    └───────────────────┘    │
-│        │                                                        │
-│        ▼                                                        │
-│  ┌───────────┐    ┌──────────────┐    ┌───────────────────┐    │
-│  │   Auth     │    │   Catalog    │    │    State          │    │
-│  │ (認證授權) │    │ (備份目錄)   │    │  (狀態管理)       │    │
-│  └───────────┘    └──────┬───────┘    └───────────────────┘    │
-│                          │                                      │
-│        ┌─────────────────┼─────────────────┐                   │
-│        ▼                 ▼                 ▼                   │
-│  ┌───────────┐    ┌──────────────┐   ┌──────────────────┐     │
-│  │ Executor   │    │  Kanister    │   │ Controller Mgr   │     │
-│  │ (備份執行) │    │ (Blueprint   │   │ (Policy 排程/    │     │
-│  │ ×3 副本    │    │  執行引擎)   │   │  生命週期管理)   │     │
-│  └─────┬─────┘    └──────────────┘   └──────────────────┘     │
-│        │                                                        │
-│        ▼                                                        │
-│  ┌───────────┐    ┌──────────────┐   ┌──────────────────┐     │
-│  │  Crypto    │    │   Jobs       │   │  Logging /       │     │
-│  │ (加密服務) │    │ (任務佇列)   │   │  Metering /      │     │
-│  │            │    │              │   │  Prometheus       │     │
-│  └───────────┘    └──────────────┘   └──────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph K10["Kasten K10 元件架構"]
+        subgraph 前端層["前端層"]
+            GW["Gateway<br/>API 入口"] --> BFF["Dashboard BFF<br/>後端代理"]
+            BFF --> FE["Frontend<br/>React Web UI"]
+        end
+
+        subgraph 核心服務["核心服務"]
+            Auth_Svc["Auth<br/>認證授權"]
+            Catalog_Svc["Catalog<br/>備份目錄"]
+            State_Svc["State<br/>狀態管理"]
+        end
+
+        subgraph 執行層["執行層"]
+            Executor_Svc["Executor ×3<br/>備份執行引擎"]
+            Kanister_Svc["Kanister<br/>Blueprint 執行引擎"]
+            CtrlMgr["Controller Manager<br/>Policy 排程 / 生命週期管理"]
+        end
+
+        subgraph 基礎服務["基礎服務"]
+            Crypto_Svc["Crypto<br/>加密服務"]
+            Jobs_Svc["Jobs<br/>任務佇列"]
+            Logging_Svc["Logging / Metering<br/>/ Prometheus"]
+        end
+    end
+
+    GW --> Auth_Svc
+    GW --> Catalog_Svc
+    Catalog_Svc --> Executor_Svc
+    Catalog_Svc --> Kanister_Svc
+    Catalog_Svc --> CtrlMgr
+    Executor_Svc --> Crypto_Svc
+    Executor_Svc --> Jobs_Svc
 ```
 
 ### 各元件職責說明
@@ -352,40 +370,18 @@ K10 由多個微服務組成，部署在 `kasten-io` namespace 中：
 
 一個完整的備份流程如下：
 
-```
-使用者建立 Policy（或手動觸發 RunAction）
-        │
-        ▼
-Controller Manager 偵測到 RunAction
-        │
-        ▼
-Executor 開始執行備份任務
-        │
-        ├─ 1. 收集應用 metadata
-        │     • 列舉 namespace 中所有 K8s 資源
-        │     • Deployments, StatefulSets, Services, ConfigMaps, Secrets, PVCs...
-        │     • 將 metadata 序列化為 JSON/YAML
-        │
-        ├─ 2. 執行 Kanister Blueprint（若有標註）
-        │     • 檢查 StatefulSet/Deployment 是否有 kanister.kasten.io/blueprint annotation
-        │     • 呼叫 Blueprint 中的 backup action
-        │     • 例如：在 MySQL Pod 內執行 mysqldump
-        │     • 將 dump 檔案的路徑記錄為 Output Artifact
-        │
-        ├─ 3. 建立 CSI VolumeSnapshot
-        │     • 對每個 PVC 呼叫 CSI Snapshot API
-        │     • CSI Driver 在儲存層建立 point-in-time snapshot
-        │     • 等待 VolumeSnapshot 狀態變為 ReadyToUse
-        │
-        ├─ 4. 建立 Restore Point
-        │     • 將 metadata + snapshot 參照 + artifact 打包為一個 Restore Point
-        │     • 儲存在 Catalog 中
-        │
-        └─ 5. Export（若 Policy 包含 export action）
-              • 將 VolumeSnapshot 的資料透過 CSI 讀取
-              • 壓縮、加密（若啟用）
-              • 上傳至 Location Profile 指定的 S3/MinIO 端點
-              • 在目標 bucket 建立匯出 metadata
+```mermaid
+flowchart TD
+    A["使用者建立 Policy<br/>或手動觸發 RunAction"] --> B["Controller Manager<br/>偵測到 RunAction"]
+    B --> C["Executor 開始執行備份任務"]
+    C --> D["1. 收集應用 Metadata<br/>列舉 namespace 中所有 K8s 資源<br/>Deployments, StatefulSets, Services,<br/>ConfigMaps, Secrets, PVCs...<br/>序列化為 JSON/YAML"]
+    D --> E["2. 執行 Kanister Blueprint<br/>（若有標註）<br/>檢查 kanister.kasten.io/blueprint annotation<br/>呼叫 backup action<br/>例如：在 MySQL Pod 內執行 mysqldump<br/>記錄 Output Artifact"]
+    E --> F["3. 建立 CSI VolumeSnapshot<br/>對每個 PVC 呼叫 CSI Snapshot API<br/>CSI Driver 建立 point-in-time snapshot<br/>等待狀態變為 ReadyToUse"]
+    F --> G["4. 建立 Restore Point<br/>打包 metadata + snapshot 參照 + artifact<br/>儲存在 Catalog 中"]
+    G --> H{"Policy 包含<br/>export action？"}
+    H -- 是 --> I["5. Export<br/>透過 CSI 讀取 VolumeSnapshot 資料<br/>壓縮、加密（若啟用）<br/>上傳至 S3/MinIO 端點<br/>建立匯出 metadata"]
+    H -- 否 --> J["備份完成"]
+    I --> J
 ```
 
 ### CRD 資源模型
@@ -418,47 +414,26 @@ apps.kio.kasten.io/v1alpha1
 
 K10 依賴 CSI（Container Storage Interface）進行 volume-level 快照：
 
-```
-K10 Executor
-    │
-    │ 建立 VolumeSnapshot CR
-    ▼
-VolumeSnapshot Controller（kube-system）
-    │
-    │ 呼叫 CSI Driver 的 CreateSnapshot gRPC
-    ▼
-CSI Hostpath Driver（本 PoC）/ 正式環境為 EBS CSI, Ceph CSI 等
-    │
-    │ 在儲存層建立 point-in-time snapshot
-    ▼
-VolumeSnapshotContent（叢集級資源）
-    │
-    └── 記錄 snapshot 的 handle（儲存層 ID）
-        可用於建立新的 PVC（還原時使用）
+```mermaid
+flowchart TD
+    A["K10 Executor"] -- "建立 VolumeSnapshot CR" --> B["VolumeSnapshot Controller<br/>（kube-system）"]
+    B -- "呼叫 CSI Driver 的<br/>CreateSnapshot gRPC" --> C["CSI Hostpath Driver（本 PoC）<br/>正式環境為 EBS CSI / Ceph CSI 等"]
+    C -- "在儲存層建立<br/>point-in-time snapshot" --> D["VolumeSnapshotContent<br/>（叢集級資源）"]
+    D --> E["記錄 snapshot handle（儲存層 ID）<br/>可用於建立新的 PVC（還原時使用）"]
 ```
 
 在本 PoC 中使用的 `csi-hostpath-snapclass` 透過 annotation `k10.kasten.io/is-snapshot-class: "true"` 讓 K10 知道應該使用這個 VolumeSnapshotClass。
 
 ### Kanister Blueprint 執行機制
 
-```
-K10 Executor 偵測到 StatefulSet 有 Blueprint annotation
-    │
-    ▼
-Kanister Service 載入 Blueprint YAML
-    │
-    ├── 解析 Go Template 變數
-    │   • {{ .StatefulSet.Namespace }} → "demo-db"
-    │   • {{ index .StatefulSet.Pods 0 }} → "mysql-0"
-    │
-    ├── 執行 Phase: dumpDatabase
-    │   • func: KubeExec → 在 mysql-0 容器內執行 shell command
-    │   • 執行 mysqldump，將結果寫入 /tmp/pocdb-dump-*.sql
-    │   • kando output dumpFile → 將檔案路徑記錄為 Output Artifact
-    │
-    └── 記錄 Output Artifact
-        • mysqlDump.keyValue.dumpFile = "/tmp/pocdb-dump-20260210.sql"
-        • 此 artifact 會被還原階段的 inputArtifactNames 參照
+```mermaid
+flowchart TD
+    A["K10 Executor<br/>偵測到 StatefulSet 有<br/>Blueprint annotation"] --> B["Kanister Service<br/>載入 Blueprint YAML"]
+    B --> C["解析 Go Template 變數<br/>.StatefulSet.Namespace → demo-db<br/>.StatefulSet.Pods[0] → mysql-0"]
+    C --> D["執行 Phase: dumpDatabase<br/>func: KubeExec<br/>在 mysql-0 容器內執行 shell command"]
+    D --> E["執行 mysqldump<br/>寫入 /tmp/pocdb-dump-*.sql"]
+    E --> F["kando output dumpFile<br/>將檔案路徑記錄為 Output Artifact"]
+    F --> G["記錄 Output Artifact<br/>mysqlDump.keyValue.dumpFile<br/>= /tmp/pocdb-dump-20260210.sql<br/>供還原階段 inputArtifactNames 參照"]
 ```
 
 ### 安全性設計
@@ -474,20 +449,20 @@ Kanister Service 載入 Blueprint YAML
 
 ---
 
-## Cleanup
+## 清理環境
 
 ```bash
-# Remove K10
+# 移除 K10
 helm uninstall k10 -n kasten-io
 kubectl delete namespace kasten-io
 
-# Remove demo apps
+# 移除示範應用
 kubectl delete namespace demo-app demo-db minio
 
-# Delete Kind cluster
+# 刪除 Kind 叢集
 kind delete cluster --name k10-poc
 ```
 
-## License
+## 授權說明
 
-This PoC uses Kasten K10 **Starter Edition** which is free and functionally identical to Enterprise, with a node limit (5 nodes after 30 days). See [Kasten Docs](https://docs.kasten.io/) for details.
+本 PoC 使用 Kasten K10 **Starter Edition**，免費且功能與 Enterprise 完全相同，僅限制節點數量（30 天後最多 5 個 Worker Node）。詳情請參閱 [Kasten 官方文件](https://docs.kasten.io/)。
