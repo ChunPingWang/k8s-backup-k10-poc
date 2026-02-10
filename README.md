@@ -149,6 +149,28 @@ echo "Token: $TOKEN"
 
 在瀏覽器開啟 `http://localhost:8080/k10/#/`，貼上 Token 即可登入。
 
+## Dashboard 畫面截圖
+
+### 登入頁面
+輸入 ServiceAccount Token 進行身份驗證：
+
+![K10 登入頁面](screenshots/01-login.png)
+
+### 主儀表板
+顯示應用程式保護狀態、策略執行統計、資料用量，以及最近的備份活動紀錄：
+
+![K10 主儀表板](screenshots/02-dashboard.png)
+
+### 應用程式列表
+K10 自動發現叢集中所有 namespace，並顯示合規狀態（Compliant / Non-Compliant / Unmanaged）以及資源統計：
+
+![K10 應用程式列表](screenshots/03-applications.png)
+
+### 備份策略
+管理所有備份策略，包含驗證狀態、資源選擇器、排程頻率與最近執行結果：
+
+![K10 備份策略](screenshots/04-policies.png)
+
 ## 專案檔案說明
 
 | 檔案 | 用途 |
@@ -466,3 +488,106 @@ kind delete cluster --name k10-poc
 ## 授權說明
 
 本 PoC 使用 Kasten K10 **Starter Edition**，免費且功能與 Enterprise 完全相同，僅限制節點數量（30 天後最多 5 個 Worker Node）。詳情請參閱 [Kasten 官方文件](https://docs.kasten.io/)。
+
+---
+
+## 附錄：使用 Playwright 自動化操作 Chrome 擷取截圖
+
+本專案的 Dashboard 截圖是透過 **Playwright** 搭配 headless Chrome 自動擷取的。以下說明如何使用此方法，也可應用於自動化測試或定期截圖報告。
+
+### 什麼是 Playwright？
+
+[Playwright](https://playwright.dev/) 是由 Microsoft 開發的瀏覽器自動化框架，支援 Chromium、Firefox、WebKit 三種引擎。相比傳統的 Puppeteer，Playwright 提供：
+
+- **更穩定的等待機制** — 自動等待元素可見、可點擊，減少 flaky test
+- **多瀏覽器支援** — 同一套 API 操作 Chrome、Firefox、Safari
+- **更強的選擇器** — 支援 `text=`、`role=`、CSS、XPath 等多種定位方式
+- **內建 trace viewer** — 錄製操作過程，方便除錯
+
+### 安裝
+
+```bash
+# 安裝 playwright-core（不含瀏覽器，使用系統已安裝的 Chrome）
+npm install playwright-core
+
+# 或安裝完整版（會自動下載瀏覽器）
+npm install playwright
+```
+
+### 截圖腳本範例
+
+本專案使用的截圖腳本 `k10-screenshots.js`：
+
+```javascript
+const { chromium } = require('playwright-core');
+const fs = require('fs');
+
+const TOKEN = fs.readFileSync('/tmp/k10_token.txt', 'utf8').trim();
+const BASE = 'http://localhost:8080/k10/';
+const OUT = './screenshots';
+
+(async () => {
+  // 啟動 headless Chrome
+  const browser = await chromium.launch({
+    executablePath: '/usr/bin/google-chrome',  // 使用系統 Chrome
+    headless: true,
+    args: ['--no-sandbox'],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 }
+  });
+  const page = await context.newPage();
+
+  // 1. 登入：填入 Token 並送出
+  await page.goto(BASE, { waitUntil: 'networkidle' });
+  await page.locator('input').first().fill(TOKEN);
+  await page.locator('button:has-text("Sign In")').first().click();
+  await page.waitForTimeout(8000);
+
+  // 2. 處理 EULA（首次登入需接受授權條款）
+  const emailInput = page.locator('input[type="email"]').first();
+  if (await emailInput.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await emailInput.fill('poc@example.com');
+    await page.locator('button:has-text("Accept")').click();
+    await page.waitForTimeout(10000);
+  }
+
+  // 3. 擷取各頁面截圖
+  await page.screenshot({ path: `${OUT}/dashboard.png` });
+
+  await page.goto(`${BASE}#/applications`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `${OUT}/applications.png` });
+
+  await page.goto(`${BASE}#/policies`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `${OUT}/policies.png` });
+
+  await browser.close();
+})();
+```
+
+### 執行方式
+
+```bash
+# 1. 確保 K10 port-forward 正在運行
+kubectl --namespace kasten-io port-forward service/gateway 8080:80 &
+
+# 2. 產生 Token
+kubectl create token gateway -n kasten-io --duration=24h > /tmp/k10_token.txt
+
+# 3. 執行截圖腳本
+node k10-screenshots.js
+```
+
+### 其他瀏覽器自動化工具比較
+
+| 工具 | 語言 | 瀏覽器支援 | 特色 |
+|------|------|-----------|------|
+| **Playwright** | JS/TS/Python/Java/.NET | Chromium, Firefox, WebKit | 微軟維護、auto-wait、trace viewer |
+| **Puppeteer** | JS/TS | Chromium 為主 | Google 維護、與 Chrome DevTools 深度整合 |
+| **Selenium** | 多語言 | 所有主流瀏覽器 | 老牌工具、WebDriver 標準、社群龐大 |
+| **Cypress** | JS/TS | Chromium, Firefox | 專注 E2E 測試、內建 time-travel 除錯 |
+
+> 本專案選用 **Playwright + playwright-core** 的組合，因為它不需要額外下載瀏覽器（直接使用系統已安裝的 Chrome），且 API 設計對表單互動（填入 Token、點擊按鈕、等待頁面載入）的支援最為穩定。
